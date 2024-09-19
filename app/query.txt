@@ -1,0 +1,202 @@
+CREATE TABLE roles (
+	role_id SERIAL PRIMARY KEY,
+	role_name VARCHAR NOT NULL
+);
+
+CREATE TABLE users (
+	user_id SERIAL PRIMARY KEY,
+	username VARCHAR(50) UNIQUE NOT NULL,
+	password VARCHAR(255) NOT NULL,
+	role_id INT REFERENCES roles(role_id)
+);
+
+CREATE TABLE categories (
+	category_id SERIAL PRIMARY KEY,
+	category_name VARCHAR NOT NULL
+);
+
+CREATE TABLE modules (
+	module_id SERIAL PRIMARY KEY,
+	module_name VARCHAR NOT NULL,
+	description TEXT,
+	dir_path VARCHAR NOT NULL,
+	created_by INT REFERENCES users(user_id)
+);
+
+CREATE TABLE documents (
+	doc_id SERIAL PRIMARY KEY,
+	doc_name VARCHAR(255) NOT NULL,
+	description TEXT,
+	created_by INT REFERENCES users(user_id)
+);
+
+CREATE TABLE doc_versions (
+	ver_id SERIAL PRIMARY KEY,
+	doc_id INT REFERENCES documents(doc_id),
+	module_id INT REFERENCES modules(module_id),
+	ver_number INT NOT NULL,
+	file_path VARCHAR NOT NULL,
+	uploaded_by INT REFERENCES users(user_id),
+	uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE module_hierarchy (
+	parent_id INT REFERENCES modules(module_id),
+	child_id INT REFERENCES modules(module_id),
+	PRIMARY KEY (parent_id, child_id)
+);
+
+CREATE TABLE doc_categories (
+	doc_id INT REFERENCES documents(doc_id),
+	category_id INT REFERENCES categories(category_id),
+	PRIMARY KEY (doc_id, category_id)
+);
+
+
+INSERT INTO roles(role_name)
+VALUES ('администратор'), ('редактор');
+
+INSERT INTO users(username, password, role_id)
+VALUES ('admin', 'admin', 1);
+
+INSERT INTO categories (category_name)
+VALUES ('техническое задание'), ('пояснительная записка'), ('эксплуатационные документы'), ('организационно-распорядительные документы');
+
+-- Вставляем модули
+INSERT INTO modules (module_name, description, created_by) VALUES
+('Module A', 'Description of Module A', 1),
+('Module B', 'Description of Module B', 1);
+
+-- Вставляем документы для модулей
+INSERT INTO documents (doc_name, description, created_by) VALUES
+('Document A1', 'Description of Document A1', 1),
+('Document B1', 'Description of Document B1', 1),
+('Document B2', 'Description of Document B2', 1);
+
+INSERT INTO doc_categories (doc_id, category_id)
+VALUES (1, 1), (2, 1), (3, 2);
+
+-- Вставляем первую версию документов для модулей
+INSERT INTO doc_versions (doc_id, module_id, ver_number, file_path, uploaded_by) VALUES
+((SELECT doc_id FROM documents WHERE doc_name = 'Document A1'),
+(SELECT module_id FROM modules WHERE module_name = 'Module A'),
+1, '/path/to/ModuleA/DocumentA1_v1.pdf', 1),
+((SELECT doc_id FROM documents WHERE doc_name = 'Document B1'),
+(SELECT module_id FROM modules WHERE module_name = 'Module B'),
+1, '/path/to/ModuleB/DocumentB1_v1.pdf', 1),
+((SELECT doc_id FROM documents WHERE doc_name = 'Document B2'),
+(SELECT module_id FROM modules WHERE module_name = 'Module B'),
+1, '/path/to/ModuleB/DocumentB2_v1.pdf', 1);
+
+-- Привязываем модуль A к модулю B как подмодуль
+INSERT INTO module_hierarchy (child_id, parent_id)
+VALUES (
+(SELECT module_id FROM modules WHERE module_name = 'Module A'),
+(SELECT module_id FROM modules WHERE module_name = 'Module B')
+);
+
+-- Копируем документы модуля A в модуль B при привязке подмодуля
+DO $$
+	DECLARE
+		child_id INT;
+		parent_id INT;
+		doc RECORD;
+		new_doc_id INT;
+		new_file_path VARCHAR(255);
+	BEGIN
+		-- Получаем ID модулей
+		SELECT module_id INTO child_id FROM modules WHERE module_name = 'Module A';
+		SELECT module_id INTO parent_id FROM modules WHERE module_name = 'Module B';
+
+		-- Копируем документы модуля A в модуль B
+		FOR doc IN (
+			SELECT d.doc_id, d.doc_name, d.description, d.created_by, v.ver_number, v.file_path
+			FROM doc_versions v
+			JOIN documents d ON v.doc_id = d.doc_id
+			WHERE v.module_id = child_id
+		)
+		LOOP
+			-- Создаем новую запись документа, если это первый документ
+			IF NOT EXISTS (SELECT 1 FROM documents WHERE doc_name = doc.doc_name) THEN
+				INSERT INTO documents (doc_name, description, created_by, created_at)
+				VALUES (doc.doc_name, doc.description, doc.created_by, NOW())
+				RETURNING doc_id INTO new_doc_id;
+			ELSE
+				SELECT doc_id INTO new_doc_id FROM documents WHERE doc_name = doc.doc_name;
+			END IF;
+
+			-- Создаем новый путь к файлу для модуля B
+			new_file_path := '/path/to/ModuleB/ModuleA/' || substring(doc.file_path from '[^/]+$');
+
+			-- Создаем новую версию документа для модуля B
+			INSERT INTO doc_versions (doc_id, module_id, ver_number, file_path, uploaded_by, uploaded_at)
+			VALUES (new_doc_id, parent_id, doc.ver_number + 1, new_file_path, 1, NOW());
+		END LOOP;
+END $$;
+
+
+SELECT
+    d.doc_name,
+--     d.description,
+    v.ver_number,
+    v.file_path
+FROM
+    modules m
+    JOIN doc_versions v ON m.module_id = v.module_id
+    JOIN documents d ON v.doc_id = d.doc_id
+    JOIN doc_categories dc ON d.doc_id = dc.doc_id
+WHERE
+    m.module_name = 'Module A'
+	AND dc.category_id = 2;
+
+
+CREATE OR REPLACE FUNCTION copy_module_documents(
+	child_module_name VARCHAR,
+    parent_module_name VARCHAR,
+    target_path VARCHAR)
+RETURNS TABLE(file_path VARCHAR) AS $$
+	DECLARE
+		child_id INT;
+		parent_id INT;
+		doc RECORD;
+		new_doc_id INT;
+		new_file_path VARCHAR(255);
+	BEGIN
+	DROP TABLE IF EXISTS temp_new_file_paths;
+	CREATE TEMP TABLE temp_new_file_paths (file_path VARCHAR(255));
+	
+	-- Получаем ID модулей
+    SELECT module_id INTO child_id FROM modules WHERE module_name = child_module_name;
+    SELECT module_id INTO parent_id FROM modules WHERE module_name = parent_module_name;
+	
+	FOR doc IN (
+		SELECT d.doc_id, d.doc_name, d.description, d.created_by, v.ver_number, v.file_path, m.module_name, m.dir_path
+		FROM doc_versions v
+		JOIN documents d ON v.doc_id = d.doc_id
+		JOIN modules m ON v.module_id = m.module_id
+		WHERE v.module_id = child_id
+	)
+	LOOP
+		-- Создаем новую запись документа, если это первый документ
+		IF NOT EXISTS (SELECT 1 FROM documents WHERE doc_name = doc.doc_name) THEN
+			INSERT INTO documents (doc_name, description, created_by, created_at)
+			VALUES (doc.doc_name, doc.description, doc.created_by, NOW())
+			RETURNING doc_id INTO new_doc_id;
+		ELSE
+			SELECT doc_id INTO new_doc_id FROM documents WHERE doc_name = doc.doc_name;
+		END IF;
+
+		-- Создаем новый путь к файлу для родительского модуля
+		new_file_path := target_path || substring(doc.file_path from strpos(doc.file_path, doc.module_name));
+		
+		INSERT INTO temp_new_file_paths (file_path) VALUES (new_file_path);
+
+		-- Создаем новую версию документа для родительского модуля
+		INSERT INTO doc_versions (doc_id, module_id, ver_number, file_path, uploaded_by, uploaded_at)
+		VALUES (new_doc_id, parent_id, doc.ver_number + 1, new_file_path, 1, NOW());
+	END LOOP;
+	RETURN QUERY SELECT * FROM temp_new_file_paths;
+END $$ LANGUAGE plpgsql;
+
+-- DROP TABLE temp_new_file_paths;
+SELECT * FROM copy_module_documents();
